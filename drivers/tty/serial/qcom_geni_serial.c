@@ -1851,6 +1851,8 @@ static int qcom_geni_serial_suspend(struct device *dev)
 	struct qcom_geni_serial_port *port = dev_get_drvdata(dev);
 	struct uart_port *uport = &port->uport;
 	struct qcom_geni_private_data *private_data = uport->private_data;
+	bool irq_masked;
+	int ret;
 
 	/*
 	 * This is done so we can hit the lowest possible state in suspend
@@ -1860,7 +1862,17 @@ static int qcom_geni_serial_suspend(struct device *dev)
 		geni_icc_set_tag(&port->se, QCOM_ICC_TAG_ACTIVE_ONLY);
 		geni_icc_set_bw(&port->se);
 	}
-	return uart_suspend_port(private_data->drv, uport);
+
+	/* Mask the level-triggered IRQ so a latched status cannot storm. */
+	irq_masked = console_suspend_enabled || !uart_console(uport);
+	if (irq_masked)
+		disable_irq(uport->irq);
+
+	ret = uart_suspend_port(private_data->drv, uport);
+	if (ret && irq_masked)
+		enable_irq(uport->irq);
+
+	return ret;
 }
 
 static int qcom_geni_serial_resume(struct device *dev)
@@ -1871,6 +1883,9 @@ static int qcom_geni_serial_resume(struct device *dev)
 	struct qcom_geni_private_data *private_data = uport->private_data;
 
 	ret = uart_resume_port(private_data->drv, uport);
+	if (console_suspend_enabled || !uart_console(uport))
+		enable_irq(uport->irq);
+
 	if (uart_console(uport)) {
 		geni_icc_set_tag(&port->se, QCOM_ICC_TAG_ALWAYS);
 		geni_icc_set_bw(&port->se);
