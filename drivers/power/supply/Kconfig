@@ -1097,4 +1097,27 @@ config FUEL_GAUGE_MM8013
 	  the state of charge, temperature, cycle count, actual and design
 	  capacity, etc.
 
+config MACSMC_POWER
+	tristate "Apple SMC Battery and Power Driver"
+	depends on MFD_MACSMC
+	help
+	  This driver provides support for the battery and AC adapter on
+	  Apple Silicon machines. It exposes battery telemetry (voltage,
+	  current, health) and AC adapter status through the standard Linux
+	  power supply framework.
+
+	  Say Y or M here if you have an Apple Silicon based Mac.
+
+config CHARGER_IDTP9418
+	tristate "idtp9418 Wireless Power Charger driver"
+	depends on I2C
+	select REGMAP_I2C
+	help
+	  Say Y here to enable the idtp9418 Wireless Power Charger driver.
+	  It enables the control and monitoring of the reverse wireless power
+	  charging in used in some Xiaomi tablet devices for recharging
+	  the stylus.
+
+source "drivers/power/supply/qcom_bms/Kconfig"
+
 endif # POWER_SUPPLY
