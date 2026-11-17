@@ -496,6 +496,7 @@ struct wcd_slim_codec_dai_data {
 	struct list_head slim_ch_list;
 	struct slim_stream_config sconfig;
 	struct slim_stream_runtime *sruntime;
+	bool port_disabled;
 };
 
 static const struct regmap_range_cfg wcd934x_ifc_ranges[] = {
@@ -1698,7 +1699,7 @@ static int wcd934x_slim_set_hw_params(struct wcd934x_codec *wcd,
 	struct slim_stream_config *cfg = &dai_data->sconfig;
 	struct wcd934x_slim_ch *ch;
 	u16 payload = 0;
-	int ret, i;
+	int ret, i, port_id;
 
 	cfg->ch_count = 0;
 	cfg->direction = direction;
@@ -1716,8 +1717,14 @@ static int wcd934x_slim_set_hw_params(struct wcd934x_codec *wcd,
 		return -ENOMEM;
 
 	i = 0;
+	for_each_set_bit(port_id, &cfg->port_mask, SLIM_DEVICE_MAX_PORTS) {
+		if (direction == SNDRV_PCM_STREAM_PLAYBACK)
+			cfg->chs[i++] = wcd->rx_chs[port_id - WCD934X_RX_START].ch_num;
+		else
+			cfg->chs[i++] = wcd->tx_chs[port_id].ch_num;
+	}
+
 	list_for_each_entry(ch, slim_ch_list, list) {
-		cfg->chs[i++] = ch->ch_num;
 		if (direction == SNDRV_PCM_STREAM_PLAYBACK) {
 			/* write to interface device */
 			ret = regmap_write(wcd->if_regmap,
@@ -1757,6 +1764,7 @@ static int wcd934x_slim_set_hw_params(struct wcd934x_codec *wcd,
 		}
 	}
 
+	dai_data->port_disabled = false;
 	dai_data->sruntime = slim_stream_allocate(wcd->sdev, "WCD934x-SLIM");
 
 	return 0;
@@ -1869,6 +1877,24 @@ static int wcd934x_hw_free(struct snd_pcm_substream *substream,
 	return 0;
 }
 
+static void wcd934x_slim_update_port(struct wcd934x_codec *wcd,
+				     struct wcd_slim_codec_dai_data *dai_data,
+				     bool enable)
+{
+	struct wcd934x_slim_ch *ch;
+	u16 val = enable ? WCD934X_SLIM_WATER_MARK_VAL : SLAVE_PORT_DISABLE;
+	u16 reg;
+
+	list_for_each_entry(ch, &dai_data->slim_ch_list, list) {
+		if (dai_data->sconfig.direction == SNDRV_PCM_STREAM_PLAYBACK)
+			reg = WCD934X_SLIM_PGD_RX_PORT_CFG(ch->port);
+		else
+			reg = WCD934X_SLIM_PGD_TX_PORT_CFG(ch->port);
+
+		regmap_write(wcd->if_regmap, reg, val);
+	}
+}
+
 static int wcd934x_trigger(struct snd_pcm_substream *substream, int cmd,
 			   struct snd_soc_dai *dai)
 {
@@ -1887,10 +1913,19 @@ static int wcd934x_trigger(struct snd_pcm_substream *substream, int cmd,
 		cfg = &dai_data->sconfig;
 		slim_stream_prepare(dai_data->sruntime, cfg);
 		slim_stream_enable(dai_data->sruntime);
+		if (dai_data->sconfig.direction == SNDRV_PCM_STREAM_CAPTURE &&
+		    dai_data->port_disabled) {
+			wcd934x_slim_update_port(wcd, dai_data, true);
+			dai_data->port_disabled = false;
+		}
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+		if (dai_data->sconfig.direction == SNDRV_PCM_STREAM_CAPTURE) {
+			wcd934x_slim_update_port(wcd, dai_data, false);
+			dai_data->port_disabled = true;
+		}
 		slim_stream_disable(dai_data->sruntime);
 		slim_stream_unprepare(dai_data->sruntime);
 		break;
@@ -1943,7 +1978,7 @@ static int wcd934x_get_channel_map(const struct snd_soc_dai *dai,
 {
 	struct wcd934x_slim_ch *ch;
 	struct wcd934x_codec *wcd;
-	int i = 0;
+	int i = 0, j, k;
 
 	wcd = snd_soc_component_get_drvdata(dai->component);
 
@@ -1961,6 +1996,13 @@ static int wcd934x_get_channel_map(const struct snd_soc_dai *dai,
 		list_for_each_entry(ch, &wcd->dai[dai->id].slim_ch_list, list)
 			rx_slot[i++] = ch->ch_num;
 
+		for (j = 0; j < i; j++) {
+			for (k = j + 1; k < i; k++) {
+				if (rx_slot[j] > rx_slot[k])
+					swap(rx_slot[j], rx_slot[k]);
+			}
+		}
+
 		*rx_num = i;
 		break;
 	case AIF1_CAP:
@@ -1974,6 +2016,13 @@ static int wcd934x_get_channel_map(const struct snd_soc_dai *dai,
 
 		list_for_each_entry(ch, &wcd->dai[dai->id].slim_ch_list, list)
 			tx_slot[i++] = ch->ch_num;
+
+		for (j = 0; j < i; j++) {
+			for (k = j + 1; k < i; k++) {
+				if (tx_slot[j] > tx_slot[k])
+					swap(tx_slot[j], tx_slot[k]);
+			}
+		}
 
 		*tx_num = i;
 		break;
@@ -2286,8 +2335,11 @@ static irqreturn_t wcd934x_slim_irq_handler(int irq, void *data)
 			}
 		}
 
+		/* Port closure is a normal stream-stop notification. Keep
+		 * FIFO overflow/underflow reports above at error level.
+		 */
 		if (val & WCD934X_SLIM_IRQ_PORT_CLOSED)
-			dev_err_ratelimited(wcd->dev,
+			dev_dbg_ratelimited(wcd->dev,
 					    "Port Closed %s port %d, value %x\n",
 					    (tx ? "TX" : "RX"), port_id, val);
 
@@ -3328,8 +3380,16 @@ static int slim_rx_mux_put(struct snd_kcontrol *kc,
 			return 0;
 
 		if (list_empty(&wcd->rx_chs[port_id].list)) {
-			list_add_tail(&wcd->rx_chs[port_id].list,
-				      &wcd->dai[aif_id].slim_ch_list);
+			struct list_head *ptr;
+
+			list_for_each(ptr, &wcd->dai[aif_id].slim_ch_list) {
+				struct wcd934x_slim_ch *cur =
+					list_entry(ptr, struct wcd934x_slim_ch, list);
+
+				if (cur->port > wcd->rx_chs[port_id].port)
+					break;
+			}
+			list_add_tail(&wcd->rx_chs[port_id].list, ptr);
 		} else {
 			dev_err(wcd->dev ,"SLIM_RX%d PORT is busy\n", port_id);
 			return 0;
@@ -3799,8 +3859,16 @@ static int slim_tx_mixer_put(struct snd_kcontrol *kc,
 
 	if (enable) {
 		if (list_empty(&wcd->tx_chs[port_id].list)) {
-			list_add_tail(&wcd->tx_chs[port_id].list,
-				      &wcd->dai[dai_id].slim_ch_list);
+			struct list_head *ptr;
+
+			list_for_each(ptr, &wcd->dai[dai_id].slim_ch_list) {
+				struct wcd934x_slim_ch *cur =
+					list_entry(ptr, struct wcd934x_slim_ch, list);
+
+				if (cur->port > wcd->tx_chs[port_id].port)
+					break;
+			}
+			list_add_tail(&wcd->tx_chs[port_id].list, ptr);
 		} else {
 			dev_err(wcd->dev ,"SLIM_TX%d PORT is busy\n", port_id);
 			return 0;
@@ -5704,6 +5772,14 @@ static const struct snd_soc_dapm_route wcd934x_audio_map[] = {
 	{"SPK2 OUT", NULL, "RX INT8 CHAIN"},
 
 	/* Tx */
+	{"AIF1 CAP", NULL, "MCLK"},
+	{"AIF2 CAP", NULL, "MCLK"},
+	{"AIF3 CAP", NULL, "MCLK"},
+	{"AIF1 PB", NULL, "MCLK"},
+	{"AIF2 PB", NULL, "MCLK"},
+	{"AIF3 PB", NULL, "MCLK"},
+	{"AIF4 PB", NULL, "MCLK"},
+
 	{"AIF1 CAP", NULL, "AIF1_CAP Mixer"},
 	{"AIF2 CAP", NULL, "AIF2_CAP Mixer"},
 	{"AIF3 CAP", NULL, "AIF3_CAP Mixer"},
