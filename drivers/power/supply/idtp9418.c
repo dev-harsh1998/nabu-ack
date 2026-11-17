@@ -5,6 +5,7 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/i2c.h>
+#include <linux/gpio/consumer.h>
 #include <linux/regmap.h>
 #include <linux/power_supply.h>
 #include <linux/pinctrl/consumer.h>
