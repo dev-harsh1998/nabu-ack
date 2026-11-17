@@ -12,30 +12,37 @@
 
 void iris_core_deinit(struct iris_core *core)
 {
-	pm_runtime_resume_and_get(core->dev);
+	int ret;
+
+	ret = pm_runtime_resume_and_get(core->dev);
 
 	mutex_lock(&core->lock);
 	if (core->state != IRIS_CORE_DEINIT) {
+		if (core->iris_platform_data->legacy_vpu5)
+			iris_set_hw_state(core, false);
 		iris_fw_unload(core);
-		iris_vpu_power_off(core);
+
+		if (!ret)
+			iris_vpu_power_off(core);
+
 		iris_hfi_queues_deinit(core);
 		core->state = IRIS_CORE_DEINIT;
 	}
 	mutex_unlock(&core->lock);
 
-	pm_runtime_put_sync(core->dev);
+	if (!ret)
+		pm_runtime_put_sync(core->dev);
 }
 
 static int iris_wait_for_system_response(struct iris_core *core)
 {
-	u32 hw_response_timeout_val = core->iris_platform_data->hw_response_timeout;
 	int ret;
 
 	if (core->state == IRIS_CORE_ERROR)
 		return -EIO;
 
 	ret = wait_for_completion_timeout(&core->core_init_done,
-					  msecs_to_jiffies(hw_response_timeout_val));
+					  msecs_to_jiffies(HW_RESPONSE_TIMEOUT_VALUE));
 	if (!ret) {
 		core->state = IRIS_CORE_ERROR;
 		return -ETIMEDOUT;
@@ -71,9 +78,24 @@ int iris_core_init(struct iris_core *core)
 	if (ret)
 		goto error_power_off;
 
+	if (core->iris_platform_data->legacy_vpu5) {
+		ret = iris_set_hw_state(core, true);
+		if (ret) {
+			dev_err(core->dev,
+				"failed to resume secure VPU5 hardware state: %d\n", ret);
+			goto error_unload_fw;
+		}
+	}
+
 	ret = iris_vpu_boot_firmware(core);
 	if (ret)
 		goto error_unload_fw;
+
+	ret = iris_vpu_switch_to_hwmode(core);
+	if (ret)
+		goto error_unload_fw;
+
+	core->iris_firmware_data->init_hfi_ops(core);
 
 	ret = iris_hfi_core_init(core);
 	if (ret)
@@ -84,6 +106,8 @@ int iris_core_init(struct iris_core *core)
 	return iris_wait_for_system_response(core);
 
 error_unload_fw:
+	if (core->iris_platform_data->legacy_vpu5)
+		iris_set_hw_state(core, false);
 	iris_fw_unload(core);
 error_power_off:
 	iris_vpu_power_off(core);

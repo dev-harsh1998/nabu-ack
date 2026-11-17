@@ -6,7 +6,22 @@
 
 menu "Qualcomm firmware drivers"
 
+config QCOM_PAS
+	tristate "Qualcomm Peripheral Authentication Service"
+	depends on QCOM_SCM
+	help
+	  Support for the Qualcomm Peripheral Authentication Service (PAS),
+	  used to load and authenticate firmware for remote processors.
+
+config QCOM_PAS_TEE
+	tristate "Qualcomm PAS TEE interface"
+	depends on QCOM_PAS
+	select QCOM_TZMEM
+	help
+	  PAS firmware authentication through the TEE.
+
 config QCOM_SCM
+	select QCOM_PAS
 	select QCOM_TZMEM
 	tristate
 
